@@ -1,0 +1,545 @@
+---
+title: "Remedy for Class Imbalance: Alternative Cutoffs (Thresholds)"
+format: pdf
+editor: visual
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+#### ---------------------------------------------------------------------------
+
+### Load libraries and dataset
+
+```{r}
+library(tidyverse)
+library(tidymodels)   
+tidymodels_prefer()   
+
+
+attrition <- read_csv("attrition.csv")   # load dataset
+
+# response - Attrition
+# features - all remaining variables
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+
+### Data exploration and necessary cleaning
+
+```{r}
+# convert all character variables to factor variables
+
+attrition <- attrition |>
+  mutate(across(where(is.character), as.factor))
+
+```
+
+
+```{r}
+
+# relevel the levels of the ordinal categorical features
+
+attrition$BusinessTravel <- factor(attrition$BusinessTravel, 
+                            levels = c("Non-Travel", "Travel_Rarely", "Travel_Frequently"))
+
+attrition$Education <- factor(attrition$Education, 
+                            levels = c("Below_College", "College", "Bachelor", "Master", "Doctor"))
+
+attrition$EnvironmentSatisfaction <- factor(attrition$EnvironmentSatisfaction,
+                            levels = c("Low", "Medium", "High", "Very_High"))
+
+attrition$JobInvolvement <- factor(attrition$JobInvolvement,
+                            levels = c("Low", "Medium", "High", "Very_High"))
+
+attrition$JobSatisfaction <- factor(attrition$JobSatisfaction,
+                            levels = c("Low", "Medium", "High", "Very_High"))
+
+attrition$RelationshipSatisfaction <- factor(attrition$RelationshipSatisfaction,
+                            levels = c("Low", "Medium", "High", "Very_High"))
+
+attrition$WorkLifeBalance <- factor(attrition$WorkLifeBalance,
+                            levels = c("Bad", "Good", "Better", "Best"))
+
+```
+
+
+```{r}
+# verify the levels of every factor
+
+attrition |>
+  select(where(is.factor)) |>
+  map(levels)
+
+```
+
+
+```{r}
+# make "Yes" (employee leaves) the first level, that is, the event of interest
+
+attrition <- attrition |>
+  mutate(Attrition = fct_relevel(Attrition, "Yes"))
+
+levels(attrition$Attrition)
+
+```
+
+
+```{r}
+# imbalanced dataset in terms of response classes
+
+attrition |>
+  count(Attrition) |>
+  mutate(prop = n / sum(n))
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+
+### Data splitting
+
+```{r}
+# split original data into training (60%), validation (20%), and test (20%) sets
+# stratify on the response so each set keeps the similar attrition rate
+
+set.seed(208)
+
+attrition_split <- initial_validation_split(data = attrition,
+                                            prop = c(0.6, 0.2),
+                                            strata = Attrition)
+
+attrition_train <- training(attrition_split)        # training set
+attrition_validation <- validation(attrition_split) # validation set
+attrition_test <- testing(attrition_split)          # test set
+
+```
+
+```{r}
+# DEMONSTRATION
+# verify even distribution of response classes across the three sets
+
+bind_rows(train = attrition_train,
+          validation = attrition_validation,
+          test = attrition_test,
+          .id = "set") |>
+  count(set, Attrition) |>
+  group_by(set) |>
+  mutate(prop = n / sum(n))
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+
+### Feature engineering, part 1: the base blueprint
+
+```{r}
+
+blueprint_base <- recipe(Attrition ~ ., data = attrition_train) |>
+  
+  step_integer(BusinessTravel, Education, EnvironmentSatisfaction, JobInvolvement,
+               JobSatisfaction, PerformanceRating, RelationshipSatisfaction,
+               WorkLifeBalance) |>
+  
+  step_normalize(all_numeric_predictors()) |>
+  
+  step_dummy(all_nominal_predictors())
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+
+### Feature engineering, part 2: creating and transforming variables
+
+Before writing new steps, we look at the **training set only** for ideas. Exploring the full data set before splitting is a form of data leakage: patterns we "discover" in the test rows end up shaping the model.
+
+```{r}
+# idea 1: are recent hires more likely to leave?
+
+attrition_train |>
+  mutate(NewHire = YearsAtCompany <= 1) |>
+  group_by(NewHire) |>
+  summarize(n = n(), attrition_rate = mean(Attrition == "Yes"))
+
+```
+
+
+```{r}
+# idea 2: does the effect of overtime depend on marital status? (an interaction)
+
+attrition_train |>
+  group_by(OverTime, MaritalStatus) |>
+  summarize(n = n(), attrition_rate = mean(Attrition == "Yes"), .groups = "drop")
+
+```
+
+
+```{r}
+# idea 3: is monthly income right-skewed?
+
+ggplot(attrition_train, aes(x = MonthlyIncome)) +
+  geom_histogram(bins = 30)
+
+```
+
+
+```{r}
+# idea 4: are some categories very rare?
+
+attrition_train |>
+  count(EducationField) |>
+  mutate(prop = n / sum(n)) |>
+  arrange(prop)
+
+```
+
+
+
+```{r}
+# engineered blueprint: the base recipe plus new and transformed variables
+
+blueprint_fe <- recipe(Attrition ~ ., data = attrition_train) |>
+
+  # (1) create new variables from existing ones (computed row by row)
+  step_mutate(
+    NewHire = as.integer(YearsAtCompany <= 1),                       # flag: 1 if tenure <= 1 year
+    PriorExperience = TotalWorkingYears - YearsAtCompany,            # years worked before joining
+    AvgYearsPerCompany = TotalWorkingYears / (NumCompaniesWorked + 1), # job-hopping measure
+    RoleTenureShare = YearsInCurrentRole / (YearsAtCompany + 1)      # share of tenure in current role
+  ) |>
+
+  # (2) log-transform right-skewed features (offset = 1 because YearsAtCompany can be 0)
+  step_log(MonthlyIncome) |>
+  step_log(YearsAtCompany, offset = 1) |>
+
+  # (3) ordinal features to integers (as in the base blueprint)
+  step_integer(BusinessTravel, Education, EnvironmentSatisfaction, JobInvolvement,
+               JobSatisfaction, PerformanceRating, RelationshipSatisfaction,
+               WorkLifeBalance) |>
+
+  # (4) a safety net: a category never seen in training becomes "new" instead of NA
+  step_novel(all_nominal_predictors()) |>
+
+  # (5) lump categories with < 3% of training rows into one level
+  step_other(EducationField, JobRole, threshold = 0.03, other = "Rare") |>
+
+  # (6) normalize, then dummy encode (as in the base blueprint)
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors()) |>
+
+  # (7) interaction between overtime and marital status (needs the dummy columns)
+  step_interact(terms = ~ starts_with("OverTime_"):starts_with("MaritalStatus_")) |>
+
+  # (8) remove columns with a single value (e.g., the empty "new" dummies from step 4)
+  step_zv(all_predictors())
+
+```
+
+
+```{r}
+# DEMONSTRATION / CHECK
+# peek at the engineered features on the training data
+
+blueprint_fe |>
+  prep() |>
+  bake(new_data = NULL) |> 
+  glimpse()
+  
+```
+
+
+
+#### ---------------------------------------------------------------------------
+
+### Model specifications and workflows
+
+```{r}
+
+# logistic regression
+logistic_spec <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+
+# KNN with K to be tuned
+knn_spec <- nearest_neighbor(neighbors = tune(), weight_func = "rectangular") |>
+  set_engine("kknn") |>
+  set_mode("classification")
+
+```
+
+```{r}
+# bundle recipe + model into workflows
+
+logistic_wf <- workflow() |>              # logistic regression, base blueprint
+  add_recipe(blueprint_base) |>
+  add_model(logistic_spec)
+
+logistic_fe_wf <- logistic_wf |>          # logistic regression, engineered blueprint
+  update_recipe(blueprint_fe)
+
+knn_wf <- workflow() |>                   # KNN, base recipe
+  add_recipe(blueprint_base) |>
+  add_model(knn_spec)
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+
+### CV: compare recipes and models
+
+```{r}
+# 5-fold CV specifications stratified on the imbalanced response
+
+set.seed(208)
+
+attrition_folds <- vfold_cv(attrition_train, v = 5, strata = Attrition)
+
+# metrics to compute in each fold
+class_metrics <- metric_set(roc_auc, yardstick::sensitivity, yardstick::specificity)
+
+```
+
+
+```{r}
+# CV with logistic regression (nothing to tune, so fit_resamples())
+
+logistic_cv <- fit_resamples(logistic_wf,
+                             resamples = attrition_folds,
+                             metrics = class_metrics)
+
+collect_metrics(logistic_cv)
+
+```
+
+
+```{r}
+
+logistic_fe_cv <- fit_resamples(logistic_fe_wf,
+                                resamples = attrition_folds,
+                                metrics = class_metrics)
+
+collect_metrics(logistic_fe_cv)
+
+```
+
+
+```{r}
+# CV with KNN (tune K over 1, 3, 5, 7, 9)
+
+k_grid <- tibble(neighbors = seq(1, 10, by = 2))
+
+knn_cv <- tune_grid(knn_wf,
+                    resamples = attrition_folds,
+                    grid = k_grid,
+                    metrics = class_metrics)
+
+collect_metrics(knn_cv)
+
+```
+
+
+```{r}
+
+autoplot(knn_cv)
+
+best_k <- select_best(knn_cv, metric = "roc_auc")
+best_k
+
+```
+
+
+```{r}
+# choose the workflow with the best CV AUC
+
+chosen_wf <- _____________
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+
+### Adjust the cutoff (threshold)
+
+```{r}
+# fit the chosen workflow on the training set
+
+chosen_fit <- fit(chosen_wf, data = attrition_train)
+
+```
+
+
+```{r}
+# predictions on the validation set: augment() adds .pred_class, .pred_Yes, .pred_No
+
+val_preds <- augment(chosen_fit, new_data = attrition_validation)
+
+val_preds |>
+  select(Attrition, .pred_class, .pred_Yes, .pred_No) |>
+  head()
+
+```
+
+
+```{r}
+# baseline: confusion matrix and metrics at the default 0.5 cutoff
+
+conf_mat(val_preds, truth = Attrition, estimate = .pred_class)
+
+thresh_metrics <- metric_set(accuracy, yardstick::sensitivity, yardstick::specificity, ppv)
+
+thresh_metrics(val_preds, truth = Attrition, estimate = .pred_class)
+
+```
+
+
+```{r}
+# ROC curve and AUC for the validation set
+
+val_roc <- val_preds |>
+  roc_curve(truth = Attrition, .pred_Yes)
+
+autoplot(val_roc)
+
+val_preds |>
+  roc_auc(truth = Attrition, .pred_Yes)
+
+```
+
+
+```{r}
+# every candidate cutoff with its sensitivity and specificity
+
+val_roc
+
+```
+
+```{r}
+# DEMONSTRATION
+# how sensitivity and specificity trade off as the cutoff moves
+
+val_roc |>
+  filter(is.finite(.threshold)) |>
+  pivot_longer(c(sensitivity, specificity),
+               names_to = "metric", values_to = "value") |>
+  ggplot(aes(x = .threshold, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  labs(x = "Cutoff on P(Attrition = Yes)", y = "Value", color = NULL)
+
+```
+
+
+```{r}
+# option 1: the point on the ROC curve closest to the top-left corner (0, 1)
+
+val_roc |>
+  mutate(dist_topleft = sqrt((1 - sensitivity)^2 + (1 - specificity)^2)) |>
+  slice_min(dist_topleft, n = 1)
+
+```
+
+
+```{r}
+# option 2: "catch at least 80% of leavers"
+# among cutoffs with sensitivity >= 0.80, take the one with the best specificity
+
+val_roc |>
+  filter(sensitivity >= 0.80) |>
+  slice_max(specificity, n = 1)
+
+```
+
+
+
+```{r}
+# set the cutoff 
+
+threshold <- ________   
+
+# class label predictions for validation set using the new cutoff
+val_preds <- val_preds |>
+  mutate(.pred_class_thresh = factor(if_else(.pred_Yes >= threshold, "Yes", "No"),
+                                     levels = c("Yes", "No")))
+
+# confusion matrix for validation set
+conf_mat(val_preds, truth = Attrition, estimate = .pred_class_thresh)
+
+```
+
+
+```{r}
+# DEMONSTRATION
+# compare metrics: default 0.5 cutoff vs. new cutoff
+
+bind_rows(
+  default_0.5 = thresh_metrics(val_preds, truth = Attrition, estimate = .pred_class),
+  new_cutoff = thresh_metrics(val_preds, truth = Attrition, estimate = .pred_class_thresh),
+  .id = "cutoff"
+) |>
+  select(cutoff, .metric, .estimate) |>
+  pivot_wider(names_from = cutoff, values_from = .estimate)
+
+```
+
+
+
+#### ---------------------------------------------------------------------------
+
+### Final model and test set performance
+
+```{r}
+# last_fit(): refits the chosen workflow on training + validation (80% of the data)
+# and evaluates it once on the test set
+
+final_fit <- last_fit(chosen_wf,
+                      split = attrition_split,
+                      add_validation_set = TRUE,
+                      metrics = metric_set(roc_auc))
+
+```
+
+
+```{r}
+# test set probability predictions to class predictions with the chosen cutoff
+
+test_preds <- collect_predictions(final_fit) |>
+  mutate(.pred_class_thresh = factor(if_else(.pred_Yes >= threshold, "Yes", "No"),
+                                     levels = c("Yes", "No")))
+
+```
+
+
+```{r}
+# confusion matrix and metrics for the test set
+
+conf_mat(test_preds, truth = Attrition, estimate = .pred_class_thresh)
+
+thresh_metrics(test_preds, truth = Attrition, estimate = .pred_class_thresh)
+
+```
+
+
+```{r}
+# ROC curve for the test set
+
+test_preds |>
+  roc_curve(truth = Attrition, .pred_Yes) |>
+  autoplot()
+
+```
+
+
+#### ---------------------------------------------------------------------------
+
